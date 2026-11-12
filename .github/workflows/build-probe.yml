@@ -1,1 +1,308 @@
+name: Build Dimensity Probe
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.0.13004108" \
+            "cmake;3.22.1"
+
+      - name: Generate diagnostic app
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/dev/dimensity/probe
+          mkdir -p app/src/main/cpp
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'DimensityProbe'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.9.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          org.gradle.workers.max=2
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'dev.dimensity.probe'
+              compileSdk 35
+              ndkVersion '28.0.13004108'
+
+              defaultConfig {
+                  applicationId 'dev.dimensity.probe'
+                  minSdk 31
+                  targetSdk 35
+                  versionCode 1
+                  versionName '0.1'
+                  ndk {
+                      abiFilters 'arm64-v8a'
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path file('src/main/cpp/CMakeLists.txt')
+                      version '3.22.1'
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="天玑接口检测"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <uses-native-library
+                      android:name="libneuronusdk_adapter.mtk.so"
+                      android:required="false" />
+
+                  <uses-native-library
+                      android:name="libneuron_adapter_mgvi.so"
+                      android:required="false" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/dev/dimensity/probe/MainActivity.java <<'EOF'
+          package dev.dimensity.probe;
+
+          import android.app.Activity;
+          import android.app.ActivityManager;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+              private static native String probe();
+
+              @Override
+              public void onCreate(Bundle state) {
+                  super.onCreate(state);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int padding = (int) (16 * getResources()
+                      .getDisplayMetrics().density);
+                  root.setPadding(padding, padding, padding, padding);
+
+                  root.setOnApplyWindowInsetsListener((view, insets) -> {
+                      android.graphics.Insets bars = insets.getInsets(
+                          android.view.WindowInsets.Type.systemBars());
+                      view.setPadding(
+                          padding + bars.left, padding + bars.top,
+                          padding + bars.right, padding + bars.bottom);
+                      return insets;
+                  });
+
+                  Button copy = new Button(this);
+                  copy.setText("复制检测报告");
+                  copy.setEnabled(false);
+                  root.addView(copy);
+
+                  TextView text = new TextView(this);
+                  text.setTextSize(15);
+                  text.setTextIsSelectable(true);
+                  text.setText("正在检查系统接口……");
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.addView(text);
+                  root.addView(scroll, new LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+                  setContentView(root);
+
+                  copy.setOnClickListener(view -> {
+                      ClipboardManager clipboard =
+                          (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                      clipboard.setPrimaryClip(
+                          ClipData.newPlainText("天玑接口报告", text.getText()));
+                      Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show();
+                  });
+
+                  new Thread(() -> {
+                      ActivityManager manager =
+                          (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                      ActivityManager.MemoryInfo memory =
+                          new ActivityManager.MemoryInfo();
+                      manager.getMemoryInfo(memory);
+
+                      String report =
+                          "天玑接口检测 v0.1\n\n" +
+                          "型号: " + Build.MODEL + "\n" +
+                          "SoC 厂商: " + Build.SOC_MANUFACTURER + "\n" +
+                          "SoC 型号: " + Build.SOC_MODEL + "\n" +
+                          "Android: " + Build.VERSION.RELEASE + "\n" +
+                          "API: " + Build.VERSION.SDK_INT + "\n" +
+                          String.format(Locale.ROOT,
+                              "系统报告总内存: %.2f GiB\n当前可用内存: %.2f GiB\n",
+                              memory.totalMem / 1073741824.0,
+                              memory.availMem / 1073741824.0);
+
+                      try {
+                          System.loadLibrary("probe");
+                          report += "\n" + probe();
+                      } catch (Throwable error) {
+                          report += "\n检测模块异常:\n" + error;
+                      }
+
+                      report +=
+                          "\n\n说明：本版仅检查库可见性和接口符号。" +
+                          "\n没有加载模型，没有执行 NPU 推理。" +
+                          "\n加载失败不等于芯片不支持 NPU。";
+
+                      final String result = report;
+                      runOnUiThread(() -> {
+                          text.setText(result);
+                          copy.setEnabled(true);
+                      });
+                  }).start();
+              }
+          }
+          EOF
+
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(probe LANGUAGES CXX)
+          add_library(probe SHARED probe.cpp)
+          target_compile_features(probe PRIVATE cxx_std_17)
+          target_link_libraries(probe dl)
+          EOF
+
+          cat > app/src/main/cpp/probe.cpp <<'EOF'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <unistd.h>
+          #include <sstream>
+          #include <string>
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_dev_dimensity_probe_MainActivity_probe(
+              JNIEnv* env, jclass) {
+              std::ostringstream out;
+              out << "内存页大小: " << sysconf(_SC_PAGESIZE)
+                  << " bytes\n";
+
+              const char* libraries[] = {
+                  "libneuronusdk_adapter.mtk.so",
+                  "libneuron_adapter_mgvi.so"
+              };
+
+              const char* symbols[] = {
+                  "Neuron_getDeviceCount",
+                  "NeuronModel_create",
+                  "NeuronCompilation_create",
+                  "NeuronExecution_create"
+              };
+
+              for (const char* library : libraries) {
+                  out << "\n[" << library << "]\n";
+                  dlerror();
+                  void* handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+
+                  if (!handle) {
+                      const char* error = dlerror();
+                      out << "当前 APK 无法加载\n"
+                          << (error ? error : "无详细错误") << "\n";
+                      continue;
+                  }
+
+                  out << "库加载成功；尚未执行模型\n";
+                  for (const char* symbol : symbols) {
+                      bool found = dlsym(handle, symbol) != nullptr;
+                      out << symbol << ": "
+                          << (found ? "存在" : "未发现") << "\n";
+                  }
+                  dlclose(handle);
+              }
+
+              std::string result = out.str();
+              return env->NewStringUTF(result.c_str());
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dimensity-probe-0.1
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
