@@ -1,4 +1,4 @@
-name: Build Dimensity Probe V02
+name: Build Dimensity Probe V03
 
 on:
   workflow_dispatch:
@@ -68,6 +68,8 @@ jobs:
           API_DIR="$(dirname "$HEADER")"
 
           echo "Using header: $HEADER"
+          echo "--- header directory ---"
+          ls -l "$API_DIR" || true
           echo "NEURON_API_DIR=$API_DIR" >> "$GITHUB_ENV"
 
       - name: Generate Android project
@@ -94,7 +96,7 @@ jobs:
               }
           }
 
-          rootProject.name = 'DimensityProbeV02'
+          rootProject.name = 'DimensityProbeV03'
           include ':app'
           EOF
 
@@ -123,8 +125,8 @@ jobs:
                   applicationId 'dev.dimensity.probe2'
                   minSdk 31
                   targetSdk 35
-                  versionCode 2
-                  versionName '0.2'
+                  versionCode 3
+                  versionName '0.3'
 
                   ndk {
                       abiFilters 'arm64-v8a'
@@ -153,7 +155,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <application
-                  android:label="天玑算子测试 v0.2"
+                  android:label="天玑算子测试 v0.3"
                   android:allowBackup="false"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
@@ -221,9 +223,10 @@ jobs:
               private native String runProbe();
 
               // Called from the native test thread.
-              // Save progress before entering the next driver operation.
+              // Save progress before entering the next driver operation,
+              // so a driver crash does not lose the last known stage.
               private void onNativeProgress(String report) {
-                  getSharedPreferences("probe_v02", MODE_PRIVATE)
+                  getSharedPreferences("probe_v03", MODE_PRIVATE)
                       .edit()
                       .putString("last_report", report)
                       .commit();
@@ -244,7 +247,7 @@ jobs:
                   manager.getMemoryInfo(memory);
 
                   header =
-                      "天玑指定设备算子测试 v0.2\n\n" +
+                      "天玑指定设备算子测试 v0.3\n\n" +
                       "型号: " + Build.MODEL + "\n" +
                       "SoC 厂商: " + Build.SOC_MANUFACTURER + "\n" +
                       "SoC 型号: " + Build.SOC_MODEL + "\n" +
@@ -311,7 +314,7 @@ jobs:
                   setContentView(root);
 
                   String last = getSharedPreferences(
-                      "probe_v02", MODE_PRIVATE
+                      "probe_v03", MODE_PRIVATE
                   ).getString("last_report", "");
 
                   if (last.isEmpty()) {
@@ -424,7 +427,9 @@ jobs:
 
           #include "NeuronAdapter.h"
 
-          // Use the function-pointer typedefs supplied by the official SDK.
+          // The NeuroPilot SDK header only declares plain C functions.
+          // It does NOT ship "NeuronXxx_fn" function-pointer typedefs,
+          // so the pointer types are derived with decltype(&::name).
           #define API_FUNCTIONS(X) \
               X(Neuron_getDeviceCount) \
               X(Neuron_getDevice) \
@@ -447,14 +452,15 @@ jobs:
               X(NeuronExecution_compute) \
               X(NeuronExecution_free)
 
-          // Keep vendor libraries loaded for the process lifetime.
+          // Keep vendor libraries loaded for the whole process lifetime.
           static void* libraryHandles[2] = {nullptr, nullptr};
           static std::mutex libraryMutex;
 
           struct Api {
               void* handle = nullptr;
 
-              #define DECLARE_FN(name) name##_fn name = nullptr;
+              // One member per API, type taken from the official header.
+              #define DECLARE_FN(name) decltype(&::name) name = nullptr;
               API_FUNCTIONS(DECLARE_FN)
               #undef DECLARE_FN
 
@@ -473,7 +479,8 @@ jobs:
                       if (!handle) {
                           const char* error = dlerror();
                           throw std::runtime_error(
-                              error ? error : "dlopen failed"
+                              std::string("dlopen 失败: ") +
+                              (error ? error : "unknown error")
                           );
                       }
                   }
@@ -481,16 +488,18 @@ jobs:
                   std::string missing;
 
                   #define LOAD_FN(name) \
-                      name = reinterpret_cast<name##_fn>( \
+                      name = reinterpret_cast<decltype(&::name)>( \
                           dlsym(handle, #name)); \
-                      if (!name) missing += std::string(#name) + "\n";
+                      if (!name) { \
+                          missing += std::string("  ") + #name + "\n"; \
+                      }
 
                   API_FUNCTIONS(LOAD_FN)
                   #undef LOAD_FN
 
                   if (!missing.empty()) {
                       throw std::runtime_error(
-                          "Missing required API symbols:\n" + missing
+                          "缺少必需接口:\n" + missing
                       );
                   }
               }
@@ -520,6 +529,16 @@ jobs:
               }
           };
 
+          struct Device {
+              NeuronDevice* handle = nullptr;
+              std::string name;
+              int32_t type = -1;
+              int typeRc = -1;
+              int nameRc = -1;
+              bool supported = false;
+              int score = 0;
+          };
+
           static void check(int rc, const char* step) {
               if (rc != 0) {
                   throw std::runtime_error(
@@ -542,19 +561,46 @@ jobs:
               return text;
           }
 
-          static bool looksLikeNpu(const std::string& name) {
-              std::string s = lowerCase(name);
+          static bool has(const std::string& text, const char* needle) {
+              return text.find(needle) != std::string::npos;
+          }
 
-              bool namedNpu =
-                  s.find("mdla") != std::string::npos ||
-                  s.find("npu") != std::string::npos;
+          // NEURON_DEVICE_ACCELERATOR == 4 (same numbering as NNAPI).
+          static constexpr int32_t kDeviceTypeAccelerator = 4;
 
-              bool namedOther =
-                  s.find("cpu") != std::string::npos ||
-                  s.find("gpu") != std::string::npos ||
-                  s.find("dsp") != std::string::npos;
+          static int scoreDevice(
+              const std::string& rawName,
+              int32_t type,
+              int typeRc) {
 
-              return namedNpu && !namedOther;
+              const std::string s = lowerCase(rawName);
+
+              const bool strongNpu =
+                  has(s, "mdla") ||
+                  has(s, "npu") ||
+                  has(s, "neuron") ||
+                  has(s, "apu") ||
+                  has(s, "dimensity");
+
+              const bool otherEngine =
+                  has(s, "cpu") ||
+                  has(s, "gpu") ||
+                  has(s, "dsp") ||
+                  has(s, "reference");
+
+              if (strongNpu && !otherEngine) {
+                  return 100;
+              }
+
+              if (typeRc == 0 && type == kDeviceTypeAccelerator) {
+                  return otherEngine ? 10 : 80;
+              }
+
+              if (otherEngine) {
+                  return -50;
+              }
+
+              return 0;
           }
 
           static void runTest(
@@ -579,71 +625,59 @@ jobs:
               out << "device_count=" << count << "\n";
               emit();
 
-              if (count == 0 || count > 32) {
-                  throw std::runtime_error(
-                      "No devices or unexpected device count"
-                  );
+              if (count == 0 || count > 64) {
+                  throw std::runtime_error("设备数量异常");
               }
 
-              const NeuronDevice* selected = nullptr;
-              std::string selectedName;
+              std::vector<Device> devices(count);
 
               for (uint32_t i = 0; i < count; ++i) {
-                  const NeuronDevice* device = nullptr;
+                  Device& device = devices[i];
 
+                  // Neuron_getDevice takes a non-const out pointer.
                   check(
-                      api.Neuron_getDevice(i, &device),
+                      api.Neuron_getDevice(i, &device.handle),
                       "Neuron_getDevice"
                   );
 
-                  if (!device) {
+                  if (!device.handle) {
                       throw std::runtime_error(
-                          "Neuron_getDevice returned a null device"
+                          "Neuron_getDevice 返回空指针"
                       );
                   }
 
                   const char* name = nullptr;
-                  int32_t type = -1;
 
-                  check(
-                      api.NeuronDevice_getName(device, &name),
-                      "NeuronDevice_getName"
+                  device.nameRc = api.NeuronDevice_getName(
+                      device.handle, &name
                   );
 
-                  int typeRc = api.NeuronDevice_getType(
-                      device, &type
+                  if (device.nameRc == 0 && name != nullptr) {
+                      device.name = name;
+                  } else {
+                      device.name = "(unnamed)";
+                  }
+
+                  device.typeRc = api.NeuronDevice_getType(
+                      device.handle, &device.type
                   );
 
-                  std::string deviceName =
-                      name ? name : "(unnamed)";
+                  device.score = scoreDevice(
+                      device.name, device.type, device.typeRc
+                  );
 
                   out << "device[" << i << "]"
-                      << " name=" << deviceName
-                      << " type=" << type
-                      << " type_rc=" << typeRc
+                      << " name=" << device.name
+                      << " type=" << device.type
+                      << " type_rc=" << device.typeRc
+                      << " name_rc=" << device.nameRc
+                      << " score=" << device.score
                       << "\n";
-
-                  if (!selected && looksLikeNpu(deviceName)) {
-                      selected = device;
-                      selectedName = deviceName;
-                  }
               }
 
               emit();
 
-              if (!selected) {
-                  throw std::runtime_error(
-                      "未发现名称明确包含 MDLA/NPU 的设备。\n"
-                      "本版不自动改选 CPU/GPU/DSP。\n"
-                      "请保留上述完整设备列表供下一步分析。"
-                  );
-              }
-
-              out << "\nselected_device=" << selectedName << "\n";
-              out << "选择依据：驱动名称；不是硬件计数器证明。\n";
-              emit();
-
-              // All input/output buffers outlive the execution resources.
+              // All buffers outlive the execution resources below.
               using Half = _Float16;
 
               constexpr int elements = 1 * 8 * 8 * 16;
@@ -665,7 +699,7 @@ jobs:
 
               if (!resources.model) {
                   throw std::runtime_error(
-                      "NeuronModel_create returned null"
+                      "NeuronModel_create 返回空指针"
                   );
               }
 
@@ -685,33 +719,25 @@ jobs:
 
               // Operand 0: input A.
               check(
-                  api.NeuronModel_addOperand(
-                      resources.model, &tensor
-                  ),
+                  api.NeuronModel_addOperand(resources.model, &tensor),
                   "addOperand inputA"
               );
 
               // Operand 1: input B.
               check(
-                  api.NeuronModel_addOperand(
-                      resources.model, &tensor
-                  ),
+                  api.NeuronModel_addOperand(resources.model, &tensor),
                   "addOperand inputB"
               );
 
               // Operand 2: fused activation, NONE.
               check(
-                  api.NeuronModel_addOperand(
-                      resources.model, &scalar
-                  ),
+                  api.NeuronModel_addOperand(resources.model, &scalar),
                   "addOperand activation"
               );
 
               // Operand 3: output.
               check(
-                  api.NeuronModel_addOperand(
-                      resources.model, &tensor
-                  ),
+                  api.NeuronModel_addOperand(resources.model, &tensor),
                   "addOperand output"
               );
 
@@ -758,40 +784,76 @@ jobs:
                   "NeuronModel_finish"
               );
 
-              stage("查询所选设备是否支持该算子");
+              emit();
 
-              const NeuronDevice* devices[] = {selected};
-              bool supported = false;
+              stage("逐设备查询对该计算图的支持情况");
 
-              check(
-                  api.NeuronModel_getSupportedOperationsForDevices(
-                      resources.model,
-                      devices,
-                      1,
-                      &supported
-                  ),
-                  "getSupportedOperationsForDevices"
-              );
+              for (uint32_t i = 0; i < count; ++i) {
+                  const NeuronDevice* one[] = {devices[i].handle};
+                  bool supported = false;
 
-              out << "ADD_supported="
-                  << (supported ? "true" : "false")
-                  << "\n";
+                  int rc =
+                      api.NeuronModel_getSupportedOperationsForDevices(
+                          resources.model, one, 1, &supported
+                      );
+
+                  devices[i].supported = (rc == 0) && supported;
+
+                  out << "device[" << i << "] "
+                      << devices[i].name
+                      << " supported="
+                      << (devices[i].supported ? "true" : "false")
+                      << " rc=" << rc
+                      << "\n";
+              }
 
               emit();
 
-              if (!supported) {
+              stage("选择执行设备");
+
+              int best = -1;
+
+              for (uint32_t i = 0; i < count; ++i) {
+                  if (!devices[i].supported) {
+                      continue;
+                  }
+
+                  if (best < 0 || devices[i].score > devices[best].score) {
+                      best = static_cast<int>(i);
+                  }
+              }
+
+              if (best < 0) {
                   throw std::runtime_error(
-                      "Selected device does not report support "
-                      "for this FP16 ADD graph"
+                      "没有任何设备报告支持该 FP16 ADD 图。\n"
+                      "请把上面完整的设备列表发回分析。"
                   );
               }
 
-              stage("仅指定该设备创建编译对象");
+              const Device& chosen = devices[static_cast<size_t>(best)];
+
+              if (chosen.score < 0) {
+                  throw std::runtime_error(
+                      std::string("报告支持的设备只有 CPU/GPU/DSP: ") +
+                      chosen.name +
+                      "\n本版不自动在这种设备上执行，避免把 CPU 结果当成 NPU。"
+                  );
+              }
+
+              out << "selected_index=" << best << "\n";
+              out << "selected_device=" << chosen.name << "\n";
+              out << "selected_type=" << chosen.type << "\n";
+              out << "选择依据：设备名称与设备类型；不是硬件计数器证明。\n";
+              emit();
+
+              stage("仅在该设备上创建编译对象");
+
+              const NeuronDevice* only[] = {chosen.handle};
 
               check(
                   api.NeuronCompilation_createForDevices(
                       resources.model,
-                      devices,
+                      only,
                       1,
                       &resources.compilation
                   ),
@@ -799,9 +861,7 @@ jobs:
               );
 
               if (!resources.compilation) {
-                  throw std::runtime_error(
-                      "Compilation creation returned null"
-                  );
+                  throw std::runtime_error("编译对象为空");
               }
 
               stage("编译计算图");
@@ -809,9 +869,7 @@ jobs:
               auto compileStart = std::chrono::steady_clock::now();
 
               check(
-                  api.NeuronCompilation_finish(
-                      resources.compilation
-                  ),
+                  api.NeuronCompilation_finish(resources.compilation),
                   "NeuronCompilation_finish"
               );
 
@@ -825,12 +883,11 @@ jobs:
               out << "compile_wall_ms=" << compileMs << "\n";
               emit();
 
-              const size_t bufferBytes =
-                  inputA.size() * sizeof(Half);
+              const size_t bufferBytes = inputA.size() * sizeof(Half);
 
               for (int trial = 0; trial < 3; ++trial) {
-                  // Change both runtime inputs in every trial.
-                  // Inputs are not model constants.
+                  // Both inputs are rewritten before every trial,
+                  // so the driver cannot cache them as constants.
                   for (int i = 0; i < elements; ++i) {
                       int a = (i * 3 + trial * 5) % 17 - 8;
                       int b = (i * 7 + trial * 3) % 13 - 6;
@@ -860,16 +917,14 @@ jobs:
                   );
 
                   if (!resources.execution) {
-                      throw std::runtime_error(
-                          "Execution creation returned null"
-                      );
+                      throw std::runtime_error("执行对象为空");
                   }
 
                   check(
                       api.NeuronExecution_setInput(
                           resources.execution,
                           0,
-                          nullptr,
+                          &tensor,
                           inputA.data(),
                           bufferBytes
                       ),
@@ -880,7 +935,7 @@ jobs:
                       api.NeuronExecution_setInput(
                           resources.execution,
                           1,
-                          nullptr,
+                          &tensor,
                           inputB.data(),
                           bufferBytes
                       ),
@@ -891,7 +946,7 @@ jobs:
                       api.NeuronExecution_setOutput(
                           resources.execution,
                           0,
-                          nullptr,
+                          &tensor,
                           output.data(),
                           bufferBytes
                       ),
@@ -919,7 +974,7 @@ jobs:
                           computeEnd - computeStart
                       ).count();
 
-                  // CPU is used only to verify the returned result.
+                  // CPU is used only to verify the returned buffer.
                   // There is no CPU inference fallback in this app.
                   float maxError = 0.0f;
 
@@ -928,13 +983,12 @@ jobs:
                           static_cast<float>(inputA[i]) +
                           static_cast<float>(inputB[i]);
 
-                      float actual =
-                          static_cast<float>(output[i]);
+                      float actual = static_cast<float>(output[i]);
 
                       if (!std::isfinite(actual)) {
                           throw std::runtime_error(
-                              "Output contains NaN/Inf at index " +
-                              std::to_string(i)
+                              "输出在 index " + std::to_string(i) +
+                              " 处为 NaN/Inf（疑似缓冲区未被写入）"
                           );
                       }
 
@@ -943,8 +997,7 @@ jobs:
 
                       if (error > 0.001f) {
                           throw std::runtime_error(
-                              "Output mismatch at index " +
-                              std::to_string(i) +
+                              "输出不匹配 index " + std::to_string(i) +
                               ", expected=" + std::to_string(expected) +
                               ", actual=" + std::to_string(actual)
                           );
@@ -1003,9 +1056,7 @@ jobs:
                   }
 
                   env->CallVoidMethod(
-                      activity,
-                      progressMethod,
-                      javaMessage
+                      activity, progressMethod, javaMessage
                   );
 
                   env->DeleteLocalRef(javaMessage);
@@ -1102,7 +1153,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: dimensity-probe-v02
+          name: dimensity-probe-v03
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 7
@@ -1111,7 +1162,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dimensity-probe-v02-build-log
+          name: dimensity-probe-v03-build-log
           path: build.log
           if-no-files-found: ignore
           retention-days: 7
