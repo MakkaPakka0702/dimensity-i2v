@@ -1,1 +1,1154 @@
+name: Build Dimensity Probe V03
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.0.13004108" \
+            "cmake;3.22.1"
+
+      - name: Download official NeuroPilot SDK headers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_DIR="$RUNNER_TEMP/neuropilot-express"
+          ARCHIVE="$RUNNER_TEMP/neuropilot-express-sdk.tar.gz"
+
+          mkdir -p "$SDK_DIR"
+
+          curl --fail --location --retry 3 --max-time 600 \
+            "https://s3.ap-southeast-1.amazonaws.com/mediatek.neuropilot.com/b1c485de-fca8-4b20-836a-8b33152a3609.gz" \
+            -o "$ARCHIVE"
+
+          sha256sum "$ARCHIVE"
+          tar -xzf "$ARCHIVE" -C "$SDK_DIR"
+
+          HEADER="$(find "$SDK_DIR" -type f -name NeuronAdapter.h -print -quit)"
+
+          if [ -z "$HEADER" ]; then
+            echo "::error::NeuronAdapter.h was not found in the SDK"
+            exit 1
+          fi
+
+          API_DIR="$(dirname "$HEADER")"
+
+          echo "Using header: $HEADER"
+          echo "--- header directory ---"
+          ls -l "$API_DIR" || true
+          echo "NEURON_API_DIR=$API_DIR" >> "$GITHUB_ENV"
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p app/src/main/java/dev/dimensity/probe2
+          mkdir -p app/src/main/cpp
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = 'DimensityProbeV03'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.9.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          org.gradle.workers.max=2
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'dev.dimensity.probe2'
+              compileSdk 35
+              ndkVersion '28.0.13004108'
+
+              defaultConfig {
+                  applicationId 'dev.dimensity.probe2'
+                  minSdk 31
+                  targetSdk 35
+                  versionCode 3
+                  versionName '0.3'
+
+                  ndk {
+                      abiFilters 'arm64-v8a'
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path file('src/main/cpp/CMakeLists.txt')
+                      version '3.22.1'
+                  }
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.encoding = 'UTF-8'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:label="天玑算子测试 v0.3"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <uses-native-library
+                      android:name="libneuronusdk_adapter.mtk.so"
+                      android:required="false" />
+
+                  <uses-native-library
+                      android:name="libneuron_adapter_mgvi.so"
+                      android:required="false" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/cpp/CMakeLists.txt <<EOF
+          cmake_minimum_required(VERSION 3.22.1)
+          project(DimensityProbe LANGUAGES CXX)
+
+          add_library(probe SHARED probe.cpp)
+          target_compile_features(probe PRIVATE cxx_std_17)
+          target_include_directories(probe PRIVATE "$NEURON_API_DIR")
+          target_link_libraries(probe dl)
+          EOF
+
+          cat > app/src/main/java/dev/dimensity/probe2/MainActivity.java <<'EOF'
+          package dev.dimensity.probe2;
+
+          import android.app.Activity;
+          import android.app.ActivityManager;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.Locale;
+          import java.util.concurrent.atomic.AtomicBoolean;
+
+          public class MainActivity extends Activity {
+
+              private static final AtomicBoolean RUNNING =
+                  new AtomicBoolean(false);
+
+              private TextView output;
+              private Button start;
+              private String header;
+
+              private native String runProbe();
+
+              // Called from the native test thread.
+              // Save progress before entering the next driver operation,
+              // so a driver crash does not lose the last known stage.
+              private void onNativeProgress(String report) {
+                  getSharedPreferences("probe_v03", MODE_PRIVATE)
+                      .edit()
+                      .putString("last_report", report)
+                      .commit();
+
+                  runOnUiThread(() -> output.setText(header + report));
+              }
+
+              @Override
+              public void onCreate(Bundle state) {
+                  super.onCreate(state);
+
+                  ActivityManager.MemoryInfo memory =
+                      new ActivityManager.MemoryInfo();
+
+                  ActivityManager manager =
+                      (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+
+                  manager.getMemoryInfo(memory);
+
+                  header =
+                      "天玑指定设备算子测试 v0.3\n\n" +
+                      "型号: " + Build.MODEL + "\n" +
+                      "SoC 厂商: " + Build.SOC_MANUFACTURER + "\n" +
+                      "SoC 型号: " + Build.SOC_MODEL + "\n" +
+                      "Android: " + Build.VERSION.RELEASE + "\n" +
+                      "API: " + Build.VERSION.SDK_INT + "\n" +
+                      String.format(
+                          Locale.ROOT,
+                          "系统总内存: %.2f GiB\n启动时可用内存: %.2f GiB\n\n",
+                          memory.totalMem / 1073741824.0,
+                          memory.availMem / 1073741824.0
+                      );
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+
+                  int padding = (int) (
+                      16 * getResources().getDisplayMetrics().density
+                  );
+
+                  root.setPadding(
+                      padding, padding, padding, padding
+                  );
+
+                  root.setOnApplyWindowInsetsListener((view, insets) -> {
+                      android.graphics.Insets bars = insets.getInsets(
+                          android.view.WindowInsets.Type.systemBars()
+                      );
+
+                      view.setPadding(
+                          padding + bars.left,
+                          padding + bars.top,
+                          padding + bars.right,
+                          padding + bars.bottom
+                      );
+
+                      return insets;
+                  });
+
+                  start = new Button(this);
+                  start.setText("开始指定设备测试");
+                  start.setEnabled(!RUNNING.get());
+                  root.addView(start);
+
+                  Button copy = new Button(this);
+                  copy.setText("复制当前报告");
+                  root.addView(copy);
+
+                  output = new TextView(this);
+                  output.setTextSize(14);
+                  output.setTextIsSelectable(true);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.addView(output);
+
+                  root.addView(
+                      scroll,
+                      new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          0,
+                          1
+                      )
+                  );
+
+                  setContentView(root);
+
+                  String last = getSharedPreferences(
+                      "probe_v03", MODE_PRIVATE
+                  ).getString("last_report", "");
+
+                  if (last.isEmpty()) {
+                      output.setText(
+                          header +
+                          "尚未运行，点击上方按钮开始。\n\n" +
+                          "本版测试 FP16 小算子图，不生成视频。\n" +
+                          "若上次测试闪退，重新打开后可复制保存的阶段记录。"
+                      );
+                  } else {
+                      output.setText(
+                          header +
+                          "以下为上次保存的记录，不是本次测试结果：\n\n" +
+                          last
+                      );
+                  }
+
+                  copy.setOnClickListener(view -> {
+                      ClipboardManager clipboard =
+                          (ClipboardManager) getSystemService(
+                              CLIPBOARD_SERVICE
+                          );
+
+                      clipboard.setPrimaryClip(
+                          ClipData.newPlainText(
+                              "天玑算子测试报告",
+                              output.getText()
+                          )
+                      );
+
+                      Toast.makeText(
+                          this, "已复制", Toast.LENGTH_SHORT
+                      ).show();
+                  });
+
+                  start.setOnClickListener(view -> {
+                      if (!RUNNING.compareAndSet(false, true)) {
+                          Toast.makeText(
+                              this,
+                              "已有测试正在执行",
+                              Toast.LENGTH_SHORT
+                          ).show();
+                          return;
+                      }
+
+                      start.setEnabled(false);
+
+                      getWindow().addFlags(
+                          WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                      );
+
+                      new Thread(() -> {
+                          try {
+                              onNativeProgress("正在加载测试模块……\n");
+
+                              System.loadLibrary("probe");
+
+                              String result = runProbe();
+                              onNativeProgress(result);
+
+                          } catch (Throwable error) {
+                              onNativeProgress(
+                                  "JAVA/JNI_ERROR\n" + error
+                              );
+
+                          } finally {
+                              RUNNING.set(false);
+
+                              runOnUiThread(() -> {
+                                  start.setEnabled(true);
+
+                                  getWindow().clearFlags(
+                                      WindowManager.LayoutParams
+                                          .FLAG_KEEP_SCREEN_ON
+                                  );
+                              });
+                          }
+                      }, "NeuronSmokeTest").start();
+                  });
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+
+                  if (start != null) {
+                      start.setEnabled(!RUNNING.get());
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/cpp/probe.cpp <<'EOF'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <unistd.h>
+
+          #include <algorithm>
+          #include <cctype>
+          #include <chrono>
+          #include <cmath>
+          #include <cstdint>
+          #include <functional>
+          #include <limits>
+          #include <mutex>
+          #include <sstream>
+          #include <stdexcept>
+          #include <string>
+          #include <vector>
+
+          #include "NeuronAdapter.h"
+
+          // The NeuroPilot SDK header only declares plain C functions.
+          // It does NOT ship "NeuronXxx_fn" function-pointer typedefs,
+          // so the pointer types are derived with decltype(&::name).
+          //
+          // NOTE:
+          // NeuronDevice_getType is not declared by the 8.0.8 SDK header.
+          // Do not add it here. Device selection is name-based instead.
+          #define API_FUNCTIONS(X) \
+              X(Neuron_getDeviceCount) \
+              X(Neuron_getDevice) \
+              X(NeuronDevice_getName) \
+              X(NeuronModel_create) \
+              X(NeuronModel_free) \
+              X(NeuronModel_addOperand) \
+              X(NeuronModel_setOperandValue) \
+              X(NeuronModel_addOperation) \
+              X(NeuronModel_identifyInputsAndOutputs) \
+              X(NeuronModel_finish) \
+              X(NeuronModel_getSupportedOperationsForDevices) \
+              X(NeuronCompilation_createForDevices) \
+              X(NeuronCompilation_finish) \
+              X(NeuronCompilation_free) \
+              X(NeuronExecution_create) \
+              X(NeuronExecution_setInput) \
+              X(NeuronExecution_setOutput) \
+              X(NeuronExecution_compute) \
+              X(NeuronExecution_free)
+
+          // Keep vendor libraries loaded for the whole process lifetime.
+          static void* libraryHandles[2] = {nullptr, nullptr};
+          static std::mutex libraryMutex;
+
+          struct Api {
+              void* handle = nullptr;
+
+              // One member per API, type taken from the official header.
+              #define DECLARE_FN(name) decltype(&::name) name = nullptr;
+              API_FUNCTIONS(DECLARE_FN)
+              #undef DECLARE_FN
+
+              void load(const char* library, int index) {
+                  {
+                      std::lock_guard<std::mutex> lock(libraryMutex);
+
+                      if (!libraryHandles[index]) {
+                          libraryHandles[index] = dlopen(
+                              library, RTLD_NOW | RTLD_LOCAL
+                          );
+                      }
+
+                      handle = libraryHandles[index];
+
+                      if (!handle) {
+                          const char* error = dlerror();
+                          throw std::runtime_error(
+                              std::string("dlopen 失败: ") +
+                              (error ? error : "unknown error")
+                          );
+                      }
+                  }
+
+                  std::string missing;
+
+                  #define LOAD_FN(name) \
+                      name = reinterpret_cast<decltype(&::name)>( \
+                          dlsym(handle, #name)); \
+                      if (!name) { \
+                          missing += std::string("  ") + #name + "\n"; \
+                      }
+
+                  API_FUNCTIONS(LOAD_FN)
+                  #undef LOAD_FN
+
+                  if (!missing.empty()) {
+                      throw std::runtime_error(
+                          "缺少必需接口:\n" + missing
+                      );
+                  }
+              }
+          };
+
+          struct Resources {
+              Api& api;
+
+              NeuronModel* model = nullptr;
+              NeuronCompilation* compilation = nullptr;
+              NeuronExecution* execution = nullptr;
+
+              explicit Resources(Api& a) : api(a) {}
+
+              ~Resources() {
+                  if (execution) {
+                      api.NeuronExecution_free(execution);
+                  }
+
+                  if (compilation) {
+                      api.NeuronCompilation_free(compilation);
+                  }
+
+                  if (model) {
+                      api.NeuronModel_free(model);
+                  }
+              }
+          };
+
+          struct Device {
+              NeuronDevice* handle = nullptr;
+              std::string name;
+              int nameRc = -1;
+              bool supported = false;
+              int score = 0;
+          };
+
+          static void check(int rc, const char* step) {
+              if (rc != 0) {
+                  throw std::runtime_error(
+                      std::string(step) +
+                      " rc=" + std::to_string(rc)
+                  );
+              }
+          }
+
+          static std::string lowerCase(std::string text) {
+              std::transform(
+                  text.begin(),
+                  text.end(),
+                  text.begin(),
+                  [](unsigned char c) {
+                      return static_cast<char>(std::tolower(c));
+                  }
+              );
+
+              return text;
+          }
+
+          static bool has(const std::string& text, const char* needle) {
+              return text.find(needle) != std::string::npos;
+          }
+
+          // The 8.0.8 header has no NeuronDevice_getType.
+          // Prefer names that clearly look like MediaTek NPU devices,
+          // and reject devices whose names clearly say CPU/GPU/DSP.
+          static int scoreDevice(const std::string& rawName) {
+              const std::string s = lowerCase(rawName);
+
+              const bool strongNpu =
+                  has(s, "mdla") ||
+                  has(s, "npu") ||
+                  has(s, "neuron") ||
+                  has(s, "apu") ||
+                  has(s, "dimensity");
+
+              const bool otherEngine =
+                  has(s, "cpu") ||
+                  has(s, "gpu") ||
+                  has(s, "dsp") ||
+                  has(s, "reference");
+
+              if (strongNpu && !otherEngine) {
+                  return 100;
+              }
+
+              if (otherEngine) {
+                  return -50;
+              }
+
+              return 10;
+          }
+
+          static void runTest(
+              Api& api,
+              std::ostringstream& out,
+              const std::function<void()>& emit) {
+
+              auto stage = [&](const char* message) {
+                  out << "\n阶段: " << message << "\n";
+                  emit();
+              };
+
+              stage("枚举设备");
+
+              uint32_t count = 0;
+
+              check(
+                  api.Neuron_getDeviceCount(&count),
+                  "Neuron_getDeviceCount"
+              );
+
+              out << "device_count=" << count << "\n";
+              emit();
+
+              if (count == 0 || count > 64) {
+                  throw std::runtime_error("设备数量异常");
+              }
+
+              std::vector<Device> devices(count);
+
+              for (uint32_t i = 0; i < count; ++i) {
+                  Device& device = devices[i];
+
+                  // Neuron_getDevice takes a non-const out pointer.
+                  check(
+                      api.Neuron_getDevice(i, &device.handle),
+                      "Neuron_getDevice"
+                  );
+
+                  if (!device.handle) {
+                      throw std::runtime_error(
+                          "Neuron_getDevice 返回空指针"
+                      );
+                  }
+
+                  const char* name = nullptr;
+
+                  device.nameRc = api.NeuronDevice_getName(
+                      device.handle, &name
+                  );
+
+                  if (device.nameRc == 0 && name != nullptr) {
+                      device.name = name;
+                  } else {
+                      device.name = "(unnamed)";
+                  }
+
+                  device.score = scoreDevice(device.name);
+
+                  out << "device[" << i << "]"
+                      << " name=" << device.name
+                      << " name_rc=" << device.nameRc
+                      << " score=" << device.score
+                      << "\n";
+              }
+
+              emit();
+
+              // All buffers outlive the execution resources below.
+              using Half = _Float16;
+
+              constexpr int elements = 1 * 8 * 8 * 16;
+              uint32_t dimensions[] = {1, 8, 8, 16};
+              int32_t activationNone = 0;
+
+              std::vector<Half> inputA(elements);
+              std::vector<Half> inputB(elements);
+              std::vector<Half> output(elements);
+
+              Resources resources(api);
+
+              stage("创建 FP16 ADD 计算图");
+
+              check(
+                  api.NeuronModel_create(&resources.model),
+                  "NeuronModel_create"
+              );
+
+              if (!resources.model) {
+                  throw std::runtime_error(
+                      "NeuronModel_create 返回空指针"
+                  );
+              }
+
+              NeuronOperandType tensor{};
+              tensor.type = NEURON_TENSOR_FLOAT16;
+              tensor.dimensionCount = 4;
+              tensor.dimensions = dimensions;
+              tensor.scale = 0.0f;
+              tensor.zeroPoint = 0;
+
+              NeuronOperandType scalar{};
+              scalar.type = NEURON_INT32;
+              scalar.dimensionCount = 0;
+              scalar.dimensions = nullptr;
+              scalar.scale = 0.0f;
+              scalar.zeroPoint = 0;
+
+              // Operand 0: input A.
+              check(
+                  api.NeuronModel_addOperand(resources.model, &tensor),
+                  "addOperand inputA"
+              );
+
+              // Operand 1: input B.
+              check(
+                  api.NeuronModel_addOperand(resources.model, &tensor),
+                  "addOperand inputB"
+              );
+
+              // Operand 2: fused activation, NONE.
+              check(
+                  api.NeuronModel_addOperand(resources.model, &scalar),
+                  "addOperand activation"
+              );
+
+              // Operand 3: output.
+              check(
+                  api.NeuronModel_addOperand(resources.model, &tensor),
+                  "addOperand output"
+              );
+
+              check(
+                  api.NeuronModel_setOperandValue(
+                      resources.model,
+                      2,
+                      &activationNone,
+                      sizeof(activationNone)
+                  ),
+                  "setOperandValue activation"
+              );
+
+              uint32_t operationInputs[] = {0, 1, 2};
+              uint32_t operationOutputs[] = {3};
+
+              check(
+                  api.NeuronModel_addOperation(
+                      resources.model,
+                      NEURON_ADD,
+                      3,
+                      operationInputs,
+                      1,
+                      operationOutputs
+                  ),
+                  "NeuronModel_addOperation ADD"
+              );
+
+              uint32_t modelInputs[] = {0, 1};
+
+              check(
+                  api.NeuronModel_identifyInputsAndOutputs(
+                      resources.model,
+                      2,
+                      modelInputs,
+                      1,
+                      operationOutputs
+                  ),
+                  "identifyInputsAndOutputs"
+              );
+
+              check(
+                  api.NeuronModel_finish(resources.model),
+                  "NeuronModel_finish"
+              );
+
+              emit();
+
+              stage("逐设备查询对该计算图的支持情况");
+
+              for (uint32_t i = 0; i < count; ++i) {
+                  const NeuronDevice* one[] = {devices[i].handle};
+                  bool supportedOps[1] = {false};
+
+                  int rc =
+                      api.NeuronModel_getSupportedOperationsForDevices(
+                          resources.model, one, 1, supportedOps
+                      );
+
+                  devices[i].supported = (rc == 0) && supportedOps[0];
+
+                  out << "device[" << i << "] "
+                      << devices[i].name
+                      << " supported="
+                      << (devices[i].supported ? "true" : "false")
+                      << " rc=" << rc
+                      << "\n";
+              }
+
+              emit();
+
+              stage("选择执行设备");
+
+              int best = -1;
+
+              for (uint32_t i = 0; i < count; ++i) {
+                  if (!devices[i].supported) {
+                      continue;
+                  }
+
+                  if (best < 0 || devices[i].score > devices[best].score) {
+                      best = static_cast<int>(i);
+                  }
+              }
+
+              if (best < 0) {
+                  throw std::runtime_error(
+                      "没有任何设备报告支持该 FP16 ADD 图。\n"
+                      "请把上面完整的设备列表发回分析。"
+                  );
+              }
+
+              const Device& chosen = devices[static_cast<size_t>(best)];
+
+              if (chosen.score < 0) {
+                  throw std::runtime_error(
+                      std::string("报告支持的设备只有 CPU/GPU/DSP: ") +
+                      chosen.name +
+                      "\n本版不自动在这种设备上执行，避免把 CPU 结果当成 NPU。"
+                  );
+              }
+
+              out << "selected_index=" << best << "\n";
+              out << "selected_device=" << chosen.name << "\n";
+              out << "selected_score=" << chosen.score << "\n";
+              out << "选择依据：设备名称 + 该设备对计算图的 supports 查询；"
+                  << "不是硬件计数器证明。\n";
+              emit();
+
+              stage("仅在该设备上创建编译对象");
+
+              const NeuronDevice* only[] = {chosen.handle};
+
+              check(
+                  api.NeuronCompilation_createForDevices(
+                      resources.model,
+                      only,
+                      1,
+                      &resources.compilation
+                  ),
+                  "NeuronCompilation_createForDevices"
+              );
+
+              if (!resources.compilation) {
+                  throw std::runtime_error("编译对象为空");
+              }
+
+              stage("编译计算图");
+
+              auto compileStart = std::chrono::steady_clock::now();
+
+              check(
+                  api.NeuronCompilation_finish(resources.compilation),
+                  "NeuronCompilation_finish"
+              );
+
+              auto compileEnd = std::chrono::steady_clock::now();
+
+              double compileMs =
+                  std::chrono::duration<double, std::milli>(
+                      compileEnd - compileStart
+                  ).count();
+
+              out << "compile_wall_ms=" << compileMs << "\n";
+              emit();
+
+              const size_t bufferBytes = inputA.size() * sizeof(Half);
+
+              for (int trial = 0; trial < 3; ++trial) {
+                  // Both inputs are rewritten before every trial,
+                  // so the driver cannot cache them as constants.
+                  for (int i = 0; i < elements; ++i) {
+                      int a = (i * 3 + trial * 5) % 17 - 8;
+                      int b = (i * 7 + trial * 3) % 13 - 6;
+
+                      inputA[i] = static_cast<Half>(a * 0.125f);
+                      inputB[i] = static_cast<Half>(b * 0.25f);
+                  }
+
+                  std::fill(
+                      output.begin(),
+                      output.end(),
+                      static_cast<Half>(
+                          std::numeric_limits<float>::quiet_NaN()
+                      )
+                  );
+
+                  out << "\n阶段: 第 " << trial + 1
+                      << " 组，创建执行对象并绑定缓冲区\n";
+                  emit();
+
+                  check(
+                      api.NeuronExecution_create(
+                          resources.compilation,
+                          &resources.execution
+                      ),
+                      "NeuronExecution_create"
+                  );
+
+                  if (!resources.execution) {
+                      throw std::runtime_error("执行对象为空");
+                  }
+
+                  check(
+                      api.NeuronExecution_setInput(
+                          resources.execution,
+                          0,
+                          &tensor,
+                          inputA.data(),
+                          bufferBytes
+                      ),
+                      "NeuronExecution_setInput A"
+                  );
+
+                  check(
+                      api.NeuronExecution_setInput(
+                          resources.execution,
+                          1,
+                          &tensor,
+                          inputB.data(),
+                          bufferBytes
+                      ),
+                      "NeuronExecution_setInput B"
+                  );
+
+                  check(
+                      api.NeuronExecution_setOutput(
+                          resources.execution,
+                          0,
+                          &tensor,
+                          output.data(),
+                          bufferBytes
+                      ),
+                      "NeuronExecution_setOutput"
+                  );
+
+                  out << "阶段: 第 " << trial + 1
+                      << " 组，调用 NeuronExecution_compute\n";
+                  emit();
+
+                  auto computeStart =
+                      std::chrono::steady_clock::now();
+
+                  int computeRc = api.NeuronExecution_compute(
+                      resources.execution
+                  );
+
+                  auto computeEnd =
+                      std::chrono::steady_clock::now();
+
+                  check(computeRc, "NeuronExecution_compute");
+
+                  double computeMs =
+                      std::chrono::duration<double, std::milli>(
+                          computeEnd - computeStart
+                      ).count();
+
+                  // CPU is used only to verify the returned buffer.
+                  // There is no CPU inference fallback in this app.
+                  float maxError = 0.0f;
+
+                  for (int i = 0; i < elements; ++i) {
+                      float expected =
+                          static_cast<float>(inputA[i]) +
+                          static_cast<float>(inputB[i]);
+
+                      float actual = static_cast<float>(output[i]);
+
+                      if (!std::isfinite(actual)) {
+                          throw std::runtime_error(
+                              "输出在 index " + std::to_string(i) +
+                              " 处为 NaN/Inf（疑似缓冲区未被写入）"
+                          );
+                      }
+
+                      float error = std::fabs(actual - expected);
+                      maxError = std::max(maxError, error);
+
+                      if (error > 0.001f) {
+                          throw std::runtime_error(
+                              "输出不匹配 index " + std::to_string(i) +
+                              ", expected=" + std::to_string(expected) +
+                              ", actual=" + std::to_string(actual)
+                          );
+                      }
+                  }
+
+                  api.NeuronExecution_free(resources.execution);
+                  resources.execution = nullptr;
+
+                  out << "trial=" << trial + 1
+                      << " result=CORRECT"
+                      << " host_compute_ms=" << computeMs
+                      << " max_abs_error=" << maxError
+                      << "\n";
+
+                  emit();
+              }
+
+              stage("三组动态输入均执行并校验通过");
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_dev_dimensity_probe2_MainActivity_runProbe(
+              JNIEnv* env,
+              jobject activity) {
+
+              std::ostringstream out;
+
+              jclass activityClass = env->GetObjectClass(activity);
+
+              jmethodID progressMethod = env->GetMethodID(
+                  activityClass,
+                  "onNativeProgress",
+                  "(Ljava/lang/String;)V"
+              );
+
+              if (env->ExceptionCheck()) {
+                  env->ExceptionClear();
+                  progressMethod = nullptr;
+              }
+
+              auto emit = [&]() {
+                  if (!progressMethod) {
+                      return;
+                  }
+
+                  std::string message = out.str();
+                  jstring javaMessage =
+                      env->NewStringUTF(message.c_str());
+
+                  if (!javaMessage) {
+                      if (env->ExceptionCheck()) {
+                          env->ExceptionClear();
+                      }
+                      return;
+                  }
+
+                  env->CallVoidMethod(
+                      activity, progressMethod, javaMessage
+                  );
+
+                  env->DeleteLocalRef(javaMessage);
+
+                  if (env->ExceptionCheck()) {
+                      env->ExceptionClear();
+                  }
+              };
+
+              out << "内存页大小: "
+                  << sysconf(_SC_PAGESIZE)
+                  << " bytes\n";
+
+              out << "测试图: FP16 ADD\n";
+              out << "形状: [1,8,8,16]\n";
+              out << "动态输入组数: 3\n";
+              out << "APP 未提供 CPU/GPU 推理回退。\n";
+              emit();
+
+              const char* libraries[] = {
+                  "libneuronusdk_adapter.mtk.so",
+                  "libneuron_adapter_mgvi.so"
+              };
+
+              bool passed = false;
+
+              for (int index = 0; index < 2; ++index) {
+                  out << "\n================================\n";
+                  out << "运行时: " << libraries[index] << "\n";
+                  out << "阶段: 加载运行时并检查必需接口\n";
+                  emit();
+
+                  try {
+                      Api api;
+                      api.load(libraries[index], index);
+
+                      out << "必需接口均存在。\n";
+                      emit();
+
+                      runTest(api, out, emit);
+
+                      passed = true;
+                      out << "\nDRIVER_TEST_PASS\n";
+                      out << "所选驱动的小算子执行与结果校验通过。\n";
+                      emit();
+                      break;
+
+                  } catch (const std::exception& error) {
+                      out << "\nRUNTIME_TEST_FAILED\n";
+                      out << error.what() << "\n";
+                      emit();
+
+                  } catch (...) {
+                      out << "\nRUNTIME_TEST_FAILED\n";
+                      out << "Unknown native exception\n";
+                      emit();
+                  }
+              }
+
+              out << "\n================================\n";
+
+              if (passed) {
+                  out << "最终结果: DRIVER_TEST_PASS\n";
+                  out << "这只证明本次指定驱动的小算子测试通过。\n";
+                  out << "不是完整视频模型通过，也不是硬件计数器证明。\n";
+              } else {
+                  out << "最终结果: TEST_NOT_PASSED\n";
+                  out << "未完成指定设备的执行验证。\n";
+                  out << "这不等于 NPU 硬件损坏或无法适配。\n";
+              }
+
+              out << "host_compute_ms 是主机侧接口调用耗时，"
+                  << "不是纯 NPU 核心耗时。\n";
+
+              emit();
+
+              env->DeleteLocalRef(activityClass);
+
+              std::string result = out.str();
+              return env->NewStringUTF(result.c_str());
+          }
+          EOF
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle :app:assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --console=plain \
+            2>&1 | tee build.log
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dimensity-probe-v03
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dimensity-probe-v03-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
